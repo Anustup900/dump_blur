@@ -1,22 +1,27 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
+import json
+import logging
 
-# Assuming these utils exist in your project
 from .utils import tensor2pil, pil2tensor
 
+logger = logging.getLogger(__name__)
 
-class BlurDetectionNode:
+
+class FaceBlurDetectionNode:
     """
-    Detects blur amount in an image using multiple methods:
-    1. Laplacian variance (global sharpness)
-    2. Frequency-domain energy (FFT high-freq ratio)
-    3. Depth-aware blur map (Blinn-Phong inspired focus estimation)
+    Face-specific blur detection that works across any resolution (100x100 to 4K+).
     
-    Uses normal/depth/specular maps to distinguish intentional DoF blur
-    from defocus/motion blur, similar to how CromptonRelight uses maps
-    for lighting — but here we use them for focus-plane estimation.
+    Pipeline:
+    1. Locate face region (from bounding box JSON, or full image fallback)
+    2. Crop & normalize the face to a standard analysis size
+    3. Run blur metrics on the face crop only
+    4. Eye region gets extra weight (sharpest feature on a face)
+    
+    All kernel sizes, block sizes, FFT cutoffs scale dynamically
+    based on the actual face crop dimensions.
     """
 
     @classmethod
@@ -24,429 +29,651 @@ class BlurDetectionNode:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "method": ((
-                    "laplacian",
-                    "frequency",
-                    "gradient_energy",
-                    "combined",
-                ), {"default": "combined"}),
-                "block_size": ("INT", {
-                    "default": 32, "min": 8, "max": 256, "step": 8,
-                    "tooltip": "Tile size for local blur map computation"
+                "blur_sensitivity": ("FLOAT", {
+                    "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "0=lenient (flags only severe blur), 1=strict (flags subtle softness)"
                 }),
-                "blur_threshold": ("FLOAT", {
-                    "default": 100.0, "min": 0.0, "max": 10000.0, "step": 1.0,
-                    "tooltip": "Laplacian variance below this = blurry"
+                "eye_weight": ("FLOAT", {
+                    "default": 0.6, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "How much eye region sharpness matters vs overall face. "
+                               "0.6 = eyes contribute 60% of the score"
                 }),
-                "frequency_cutoff": ("FLOAT", {
-                    "default": 0.3, "min": 0.01, "max": 0.99, "step": 0.01,
-                    "tooltip": "FFT high-frequency ratio threshold"
+                "uniform_region_floor": ("FLOAT", {
+                    "default": 0.002, "min": 0.0, "max": 0.05, "step": 0.0005,
+                    "tooltip": "Tiles below this intensity variance = uniform skin, not blur"
                 }),
             },
             "optional": {
+                "face_bbox_json": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "JSON with face bounding box from MoonDream/detection node. "
+                               "If empty, analyzes full image as face."
+                }),
+                "face_padding": ("FLOAT", {
+                    "default": 0.15, "min": 0.0, "max": 0.5, "step": 0.05,
+                    "tooltip": "Extra padding around face bbox (fraction of face size)"
+                }),
                 "depth_map": ("IMAGE",),
                 "normal_map": ("IMAGE",),
                 "specular_map": ("IMAGE",),
                 "focus_distance": ("FLOAT", {
                     "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Normalized depth at which the image should be in focus (0=near, 1=far)"
                 }),
                 "dof_falloff": ("FLOAT", {
                     "default": 2.0, "min": 0.1, "max": 20.0, "step": 0.1,
-                    "tooltip": "Blinn-Phong-style exponent controlling DoF sharpness falloff"
                 }),
             }
         }
 
     RETURN_TYPES = ("FLOAT", "FLOAT", "MASK", "IMAGE", "STRING")
     RETURN_NAMES = (
-        "blur_score",        # 0-1 global blur amount (1 = very blurry)
-        "sharpness_score",   # 0-1 global sharpness (1 = very sharp)
-        "blur_map",          # per-pixel blur intensity mask
-        "visualization",     # heatmap overlay on original
+        "blur_score",
+        "sharpness_score",
+        "face_blur_map",
+        "visualization",
         "debug_info",
     )
-    FUNCTION = "detect_blur"
+    FUNCTION = "detect_face_blur"
     CATEGORY = "caimera_nodes/analysis"
 
+    # Standard size we normalize face crops to before analysis.
+    # Small enough to handle 100x100 inputs, large enough for detail.
+    ANALYSIS_TARGET = 256
+
+    # Eye region relative to face bbox (approximate, works for most orientations)
+    # (y_start_frac, y_end_frac, x_start_frac, x_end_frac)
+    EYE_REGION = (0.20, 0.45, 0.10, 0.90)
+
+    # Nose-mouth region (secondary sharpness check)
+    NOSE_MOUTH_REGION = (0.45, 0.80, 0.20, 0.80)
+
     # ------------------------------------------------------------------ #
-    #  Core blur metrics
+    #  Resolution-adaptive helpers
     # ------------------------------------------------------------------ #
 
     @staticmethod
+    def _adaptive_kernel_size(dim: int, fraction: float = 0.08, min_k: int = 3, max_k: int = 63) -> int:
+        """
+        Compute kernel size as a fraction of the image dimension.
+        Always returns odd number. Clamps to [min_k, max_k].
+        Works for 100px faces and 2000px faces alike.
+        """
+        k = int(dim * fraction)
+        k = max(min_k, min(k, max_k))
+        if k % 2 == 0:
+            k += 1
+        return k
+
+    @staticmethod
+    def _adaptive_block_sizes(h: int, w: int) -> tuple:
+        """
+        Generate multi-scale block sizes that make sense for the given dimensions.
+        For a 100x100 face: maybe [8, 16, 32]
+        For a 1000x1000 face: [32, 64, 128]
+        """
+        min_dim = min(h, w)
+
+        if min_dim < 64:
+            sizes = [4, 8, 16]
+            weights = [0.25, 0.35, 0.40]
+        elif min_dim < 150:
+            sizes = [8, 16, 32]
+            weights = [0.20, 0.35, 0.45]
+        elif min_dim < 400:
+            sizes = [16, 32, 64]
+            weights = [0.20, 0.35, 0.45]
+        else:
+            sizes = [32, 64, 128]
+            weights = [0.20, 0.35, 0.45]
+
+        # Ensure no block is larger than half the image
+        half = min_dim // 2
+        sizes = [min(s, half) for s in sizes]
+        sizes = [max(s, 4) for s in sizes]  # minimum 4
+
+        return sizes, weights
+
+    @staticmethod
+    def _adaptive_freq_cutoff(h: int, w: int) -> float:
+        """Scale FFT cutoff by face crop size."""
+        ref = min(h, w)
+        if ref < 64:
+            return 0.15
+        elif ref < 200:
+            return 0.20
+        elif ref < 500:
+            return 0.28
+        else:
+            return 0.20 + 0.10 * (ref / 1024.0)
+
+    # ------------------------------------------------------------------ #
+    #  Face extraction
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _extract_face_crop(image_tensor: torch.Tensor, bbox_json: str,
+                           padding: float) -> tuple:
+        """
+        Extract face region from image using bbox JSON.
+        Returns (face_crop_tensor, bbox_coords_dict, used_full_image: bool)
+        
+        Handles:
+        - MoonDream format: {"objects": [{"x_min":..., "y_min":..., ...}]}
+        - Simple format: {"x_min":..., "y_min":..., ...}
+        - Empty/invalid JSON → full image fallback
+        """
+        if image_tensor.dim() == 4:
+            img = image_tensor[0]  # (H, W, C)
+        else:
+            img = image_tensor
+
+        h, w, c = img.shape
+        used_full = False
+        bbox = None
+
+        # Try to parse bbox
+        if bbox_json and bbox_json.strip():
+            try:
+                data = json.loads(bbox_json)
+
+                # MoonDream multi-object format
+                if "objects" in data and len(data["objects"]) > 0:
+                    # Use the first (or largest) face
+                    best = None
+                    best_area = 0
+                    for obj in data["objects"]:
+                        if all(k in obj for k in ("x_min", "y_min", "x_max", "y_max")):
+                            area = (obj["x_max"] - obj["x_min"]) * (obj["y_max"] - obj["y_min"])
+                            if area > best_area:
+                                best = obj
+                                best_area = area
+                    if best:
+                        bbox = best
+
+                # Simple format
+                elif all(k in data for k in ("x_min", "y_min", "x_max", "y_max")):
+                    bbox = data
+
+            except (json.JSONDecodeError, KeyError, TypeError):
+                pass
+
+        if bbox is None:
+            # Full image fallback
+            face_crop = img
+            used_full = True
+            bbox = {"x_min": 0.0, "y_min": 0.0, "x_max": 1.0, "y_max": 1.0}
+        else:
+            # Convert normalized coords to pixels and add padding
+            bw = bbox["x_max"] - bbox["x_min"]
+            bh = bbox["y_max"] - bbox["y_min"]
+
+            x_min = max(0, bbox["x_min"] - bw * padding)
+            y_min = max(0, bbox["y_min"] - bh * padding)
+            x_max = min(1.0, bbox["x_max"] + bw * padding)
+            y_max = min(1.0, bbox["y_max"] + bh * padding)
+
+            px_x0 = int(x_min * w)
+            px_y0 = int(y_min * h)
+            px_x1 = int(x_max * w)
+            px_y1 = int(y_max * h)
+
+            # Guard against degenerate boxes
+            if px_x1 - px_x0 < 4 or px_y1 - px_y0 < 4:
+                face_crop = img
+                used_full = True
+            else:
+                face_crop = img[px_y0:px_y1, px_x0:px_x1, :]
+                used_full = False
+                bbox = {"x_min": x_min, "y_min": y_min, "x_max": x_max, "y_max": y_max}
+
+        return face_crop, bbox, used_full
+
+    # ------------------------------------------------------------------ #
+    #  Core blur metrics (resolution-aware)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _normalize_local_contrast(gray: torch.Tensor, kernel_size: int) -> torch.Tensor:
+        """Remove intensity bias. Kernel size adapts to face crop size."""
+        gray_4d = gray.unsqueeze(0).unsqueeze(0)
+        pad = kernel_size // 2
+        local_mean = F.avg_pool2d(gray_4d, kernel_size, stride=1, padding=pad)
+        local_var = F.avg_pool2d(
+            (gray_4d - local_mean) ** 2,
+            kernel_size, stride=1, padding=pad
+        )
+        local_std = torch.sqrt(local_var + 1e-6)
+        return ((gray_4d - local_mean) / local_std).squeeze()
+
+    @staticmethod
     def _laplacian_variance(gray: torch.Tensor) -> torch.Tensor:
-        """Laplacian variance — classic sharpness measure."""
         kernel = torch.tensor(
             [[0,  1, 0],
              [1, -4, 1],
              [0,  1, 0]], dtype=torch.float32, device=gray.device
         ).unsqueeze(0).unsqueeze(0)
 
-        if gray.dim() == 2:
-            gray = gray.unsqueeze(0).unsqueeze(0)
-        elif gray.dim() == 3:
-            gray = gray.unsqueeze(1)
-
-        lap = F.conv2d(gray, kernel, padding=1)
-        return lap.squeeze()
+        g = gray.unsqueeze(0).unsqueeze(0) if gray.dim() == 2 else gray.unsqueeze(1)
+        return F.conv2d(g, kernel, padding=1).squeeze()
 
     @staticmethod
-    def _frequency_energy(gray_np: np.ndarray, cutoff_ratio: float) -> tuple:
-        """FFT-based blur detection. Returns (high_freq_ratio, magnitude_spectrum)."""
+    def _gradient_energy(gray: torch.Tensor) -> torch.Tensor:
+        g = gray.unsqueeze(0).unsqueeze(0) if gray.dim() == 2 else gray.unsqueeze(1)
+
+        sx = torch.tensor(
+            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+            dtype=torch.float32, device=gray.device
+        ).unsqueeze(0).unsqueeze(0)
+        sy = torch.tensor(
+            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+            dtype=torch.float32, device=gray.device
+        ).unsqueeze(0).unsqueeze(0)
+
+        gx = F.conv2d(g, sx, padding=1)
+        gy = F.conv2d(g, sy, padding=1)
+        return torch.sqrt(gx ** 2 + gy ** 2 + 1e-8).squeeze()
+
+    @staticmethod
+    def _frequency_energy(gray_np: np.ndarray, cutoff: float) -> float:
+        """Returns high-freq energy ratio. Handles tiny images gracefully."""
+        h, w = gray_np.shape
+        if h < 8 or w < 8:
+            # Too small for meaningful FFT
+            return 0.5  # neutral
+
         f = np.fft.fft2(gray_np)
         fshift = np.fft.fftshift(f)
         mag = np.log1p(np.abs(fshift))
 
-        h, w = gray_np.shape
         cy, cx = h // 2, w // 2
-        radius = int(min(h, w) * cutoff_ratio)
+        radius = max(2, int(min(h, w) * cutoff))
 
-        # Mask out low frequencies
         Y, X = np.ogrid[:h, :w]
         dist = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
-        high_freq_mask = dist > radius
+        high_mask = dist > radius
 
-        total_energy = mag.sum() + 1e-8
-        high_energy = mag[high_freq_mask].sum()
-        ratio = high_energy / total_energy
-
-        return float(ratio), mag
-
-    @staticmethod
-    def _gradient_energy(gray: torch.Tensor) -> torch.Tensor:
-        """Sobel gradient magnitude — high values = sharp edges."""
-        if gray.dim() == 2:
-            gray = gray.unsqueeze(0).unsqueeze(0)
-        elif gray.dim() == 3:
-            gray = gray.unsqueeze(1)
-
-        sobel_x = torch.tensor(
-            [[-1, 0, 1],
-             [-2, 0, 2],
-             [-1, 0, 1]], dtype=torch.float32, device=gray.device
-        ).unsqueeze(0).unsqueeze(0)
-
-        sobel_y = torch.tensor(
-            [[-1, -2, -1],
-             [ 0,  0,  0],
-             [ 1,  2,  1]], dtype=torch.float32, device=gray.device
-        ).unsqueeze(0).unsqueeze(0)
-
-        gx = F.conv2d(gray, sobel_x, padding=1)
-        gy = F.conv2d(gray, sobel_y, padding=1)
-        magnitude = torch.sqrt(gx ** 2 + gy ** 2 + 1e-8)
-        return magnitude.squeeze()
+        total = mag.sum() + 1e-8
+        high = mag[high_mask].sum()
+        return float(high / total)
 
     # ------------------------------------------------------------------ #
-    #  Depth-aware focus estimation (Blinn-Phong inspired)
+    #  Tiled blur map with uniform exclusion
     # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _depth_focus_weight(depth_map: torch.Tensor,
-                            focus_distance: float,
-                            dof_falloff: float) -> torch.Tensor:
-        """
-        Blinn-Phong-style focus weight based on depth.
-        
-        Analogous to specular highlight computation:
-          - focus_distance acts like the "light direction" (ideal focus plane)
-          - dof_falloff acts like specular_power (controls sharpness of focus region)
-          - The dot product is replaced by depth proximity
-        
-        Returns a per-pixel weight: 1.0 = in focus plane, 0.0 = far from focus.
-        """
-        if depth_map.dim() == 4:
-            depth = depth_map[:, :, :, 0]  # take first channel
-        elif depth_map.dim() == 3:
-            depth = depth_map[0] if depth_map.shape[0] <= 4 else depth_map[:, :, 0]
-        else:
-            depth = depth_map
-
-        # Normalize depth to 0-1
-        d_min, d_max = depth.min(), depth.max()
-        if d_max - d_min > 1e-6:
-            depth_norm = (depth - d_min) / (d_max - d_min)
-        else:
-            depth_norm = torch.zeros_like(depth)
-
-        # Proximity to focus plane — Blinn-Phong style power falloff
-        proximity = 1.0 - torch.abs(depth_norm - focus_distance)
-        proximity = torch.clamp(proximity, 0.0, 1.0)
-
-        # Apply specular-power-style exponent (sharper falloff = narrower DoF)
-        focus_weight = torch.pow(proximity, dof_falloff)
-
-        return focus_weight
-
-    @staticmethod
-    def _normal_variance_map(normal_map: torch.Tensor, block_size: int) -> torch.Tensor:
-        """
-        High normal variance in a local region suggests geometric detail,
-        so blur there is more likely defocus/motion blur (not flat surface).
-        """
-        if normal_map.dim() == 4:
-            normals = normal_map[0]  # (H, W, 3)
-        else:
-            normals = normal_map
-
-        normals = normals * 2.0 - 1.0  # to [-1, 1]
-        h, w, _ = normals.shape
-
-        # Compute local variance of normals in blocks
-        var_map = torch.zeros(h, w, dtype=torch.float32, device=normals.device)
-        pad_h = (block_size - h % block_size) % block_size
-        pad_w = (block_size - w % block_size) % block_size
-
-        padded = F.pad(normals.permute(2, 0, 1).unsqueeze(0),
-                       (0, pad_w, 0, pad_h), mode='reflect')
-        padded = padded.squeeze(0)  # (3, H_pad, W_pad)
-
-        ph, pw = padded.shape[1], padded.shape[2]
-        blocks = padded.unfold(1, block_size, block_size).unfold(2, block_size, block_size)
-        # (3, num_blocks_h, num_blocks_w, block_size, block_size)
-
-        block_var = blocks.var(dim=(-1, -2)).mean(dim=0)  # (num_bh, num_bw)
-
-        # Upsample back
-        var_map = F.interpolate(
-            block_var.unsqueeze(0).unsqueeze(0),
-            size=(h, w), mode='bilinear', align_corners=False
-        ).squeeze()
-
-        # Normalize
-        v_min, v_max = var_map.min(), var_map.max()
-        if v_max - v_min > 1e-6:
-            var_map = (var_map - v_min) / (v_max - v_min)
-
-        return var_map
-
-    @staticmethod
-    def _specular_sharpness_indicator(specular_map: torch.Tensor) -> torch.Tensor:
-        """
-        Specular highlights are point-like — if they appear soft/spread,
-        the image is likely blurred. Measure local peak-to-mean ratio.
-        """
-        if specular_map.dim() == 4:
-            spec = specular_map[0].mean(dim=-1)  # grayscale
-        elif specular_map.dim() == 3:
-            spec = specular_map.mean(dim=-1) if specular_map.shape[-1] <= 4 else specular_map[0]
-        else:
-            spec = specular_map
-
-        # Local max via max-pool vs local mean via avg-pool
-        spec_4d = spec.unsqueeze(0).unsqueeze(0)
-        local_max = F.max_pool2d(spec_4d, kernel_size=15, stride=1, padding=7)
-        local_avg = F.avg_pool2d(spec_4d, kernel_size=15, stride=1, padding=7)
-
-        # High ratio = sharp specular highlights = sharp image
-        ratio = (local_max - local_avg) / (local_avg + 1e-6)
-        ratio = ratio.squeeze()
-
-        # Normalize
-        r_min, r_max = ratio.min(), ratio.max()
-        if r_max - r_min > 1e-6:
-            ratio = (ratio - r_min) / (r_max - r_min)
-
-        return ratio
-
-    # ------------------------------------------------------------------ #
-    #  Local blur map (tiled computation)
-    # ------------------------------------------------------------------ #
-
-    def _compute_local_blur_map(self, gray: torch.Tensor, block_size: int,
-                                method: str, freq_cutoff: float) -> torch.Tensor:
-        """Compute per-tile blur score and upsample to full resolution."""
-        h, w = gray.shape
+    def _compute_tile_map(self, gray_norm: torch.Tensor, gray_raw: torch.Tensor,
+                          block_size: int, freq_cutoff: float,
+                          uniform_floor: float) -> torch.Tensor:
+        h, w = gray_norm.shape
         bh = max(1, h // block_size)
         bw = max(1, w // block_size)
 
-        blur_tiles = torch.zeros(bh, bw, dtype=torch.float32, device=gray.device)
+        tiles = torch.full((bh, bw), float('nan'), dtype=torch.float32, device=gray_norm.device)
 
         for i in range(bh):
             for j in range(bw):
-                y0 = i * block_size
-                x0 = j * block_size
-                y1 = min(y0 + block_size, h)
-                x1 = min(x0 + block_size, w)
-                tile = gray[y0:y1, x0:x1]
+                y0, x0 = i * block_size, j * block_size
+                y1, x1 = min(y0 + block_size, h), min(x0 + block_size, w)
 
-                if tile.numel() < 4:
+                tile_raw = gray_raw[y0:y1, x0:x1]
+                tile_norm = gray_norm[y0:y1, x0:x1]
+
+                if tile_raw.numel() < 4:
                     continue
 
-                if method in ("laplacian", "combined"):
-                    lap = self._laplacian_variance(tile)
-                    score = lap.var().item()
-                elif method == "gradient_energy":
-                    grad = self._gradient_energy(tile)
-                    score = grad.mean().item()
-                elif method == "frequency":
-                    tile_np = tile.cpu().numpy()
-                    ratio, _ = self._frequency_energy(tile_np, freq_cutoff)
-                    score = ratio * 1000  # scale to comparable range
-                else:
-                    score = 0.0
+                # Uniform skin patch → skip, not blur
+                if tile_raw.var().item() < uniform_floor:
+                    continue
 
-                blur_tiles[i, j] = score
+                lap = self._laplacian_variance(tile_norm)
+                grad = self._gradient_energy(tile_norm)
 
-        # Normalize tiles
-        t_min, t_max = blur_tiles.min(), blur_tiles.max()
+                tile_np = tile_raw.cpu().numpy()
+                freq = self._frequency_energy(tile_np, freq_cutoff)
+
+                # Combined score
+                score = lap.var().item() + grad.mean().item() + freq * 500
+                tiles[i, j] = score
+
+        # Fill uniform tiles with median
+        valid = ~torch.isnan(tiles)
+        if valid.any():
+            med = tiles[valid].median()
+            tiles[torch.isnan(tiles)] = med
+        else:
+            tiles = torch.ones_like(tiles) * 0.5
+
+        # Normalize
+        t_min, t_max = tiles.min(), tiles.max()
         if t_max - t_min > 1e-6:
-            blur_tiles = (blur_tiles - t_min) / (t_max - t_min)
+            tiles = (tiles - t_min) / (t_max - t_min)
+        else:
+            tiles = torch.ones_like(tiles) * 0.5
 
-        # Upsample to full resolution
-        blur_map = F.interpolate(
-            blur_tiles.unsqueeze(0).unsqueeze(0),
+        return F.interpolate(
+            tiles.unsqueeze(0).unsqueeze(0),
             size=(h, w), mode='bilinear', align_corners=False
         ).squeeze()
 
-        return blur_map
+    def _multiscale_face_blur_map(self, gray_norm, gray_raw, freq_cutoff, uniform_floor):
+        h, w = gray_norm.shape
+        sizes, weights = self._adaptive_block_sizes(h, w)
+
+        maps = []
+        for bs in sizes:
+            m = self._compute_tile_map(gray_norm, gray_raw, bs, freq_cutoff, uniform_floor)
+            maps.append(m)
+
+        combined = sum(m * wt for m, wt in zip(maps, weights))
+        c_min, c_max = combined.min(), combined.max()
+        if c_max - c_min > 1e-6:
+            combined = (combined - c_min) / (c_max - c_min)
+        return combined
+
+    # ------------------------------------------------------------------ #
+    #  Eye region analysis (strongest blur indicator on a face)
+    # ------------------------------------------------------------------ #
+
+    def _analyze_face_region(self, gray_norm: torch.Tensor, gray_raw: torch.Tensor,
+                             region_bounds: tuple, freq_cutoff: float) -> dict:
+        """
+        Analyze a sub-region of the face crop.
+        region_bounds: (y_start_frac, y_end_frac, x_start_frac, x_end_frac)
+        Returns dict with sharpness metrics.
+        """
+        h, w = gray_norm.shape
+        y0 = int(h * region_bounds[0])
+        y1 = int(h * region_bounds[1])
+        x0 = int(w * region_bounds[2])
+        x1 = int(w * region_bounds[3])
+
+        # Guard
+        if y1 - y0 < 4 or x1 - x0 < 4:
+            return {"lap_var": 0.0, "grad_mean": 0.0, "freq_ratio": 0.5, "valid": False}
+
+        region_norm = gray_norm[y0:y1, x0:x1]
+        region_raw = gray_raw[y0:y1, x0:x1]
+
+        lap = self._laplacian_variance(region_norm)
+        grad = self._gradient_energy(region_norm)
+        freq = self._frequency_energy(region_raw.cpu().numpy(), freq_cutoff)
+
+        return {
+            "lap_var": lap.var().item(),
+            "grad_mean": grad.mean().item(),
+            "freq_ratio": freq,
+            "valid": True,
+        }
+
+    # ------------------------------------------------------------------ #
+    #  Depth/Normal/Specular helpers (same Blinn-Phong logic, face-cropped)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _crop_map_to_face(map_tensor: torch.Tensor, bbox: dict, target_h: int, target_w: int) -> torch.Tensor:
+        """Crop any auxiliary map to the face bbox region and resize."""
+        if map_tensor.dim() == 4:
+            m = map_tensor[0]
+        else:
+            m = map_tensor
+
+        h, w = m.shape[0], m.shape[1]
+        px_y0 = int(bbox["y_min"] * h)
+        px_y1 = int(bbox["y_max"] * h)
+        px_x0 = int(bbox["x_min"] * w)
+        px_x1 = int(bbox["x_max"] * w)
+
+        px_y0 = max(0, px_y0)
+        px_y1 = min(h, max(px_y0 + 1, px_y1))
+        px_x0 = max(0, px_x0)
+        px_x1 = min(w, max(px_x0 + 1, px_x1))
+
+        cropped = m[px_y0:px_y1, px_x0:px_x1]
+
+        if cropped.dim() == 2:
+            cropped = cropped.unsqueeze(0).unsqueeze(0)
+        else:
+            cropped = cropped.permute(2, 0, 1).unsqueeze(0)
+
+        resized = F.interpolate(cropped, size=(target_h, target_w),
+                                mode='bilinear', align_corners=False)
+        return resized.squeeze(0).permute(1, 2, 0) if resized.shape[1] > 1 else resized.squeeze()
+
+    @staticmethod
+    def _depth_focus_weight(depth_gray: torch.Tensor, focus_distance: float,
+                            dof_falloff: float) -> torch.Tensor:
+        if depth_gray.dim() > 2:
+            depth_gray = depth_gray.mean(dim=-1) if depth_gray.shape[-1] <= 4 else depth_gray[:, :, 0]
+
+        d_min, d_max = depth_gray.min(), depth_gray.max()
+        if d_max - d_min > 1e-6:
+            depth_norm = (depth_gray - d_min) / (d_max - d_min)
+        else:
+            return torch.ones_like(depth_gray)
+
+        proximity = 1.0 - torch.abs(depth_norm - focus_distance)
+        return torch.pow(torch.clamp(proximity, 0.0, 1.0), dof_falloff)
+
+    @staticmethod
+    def _specular_sharpness(spec_gray: torch.Tensor, pool_k: int) -> torch.Tensor:
+        if spec_gray.dim() > 2:
+            spec_gray = spec_gray.mean(dim=-1) if spec_gray.shape[-1] <= 4 else spec_gray[:, :, 0]
+
+        s = spec_gray.unsqueeze(0).unsqueeze(0)
+        pad = pool_k // 2
+        local_max = F.max_pool2d(s, kernel_size=pool_k, stride=1, padding=pad)
+        local_avg = F.avg_pool2d(s, kernel_size=pool_k, stride=1, padding=pad)
+        ratio = ((local_max - local_avg) / (local_avg + 1e-6)).squeeze()
+
+        r_min, r_max = ratio.min(), ratio.max()
+        if r_max - r_min > 1e-6:
+            ratio = (ratio - r_min) / (r_max - r_min)
+        return ratio
 
     # ------------------------------------------------------------------ #
     #  Visualization
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _create_heatmap_overlay(image: torch.Tensor, blur_map: torch.Tensor,
-                                alpha: float = 0.5) -> torch.Tensor:
-        """Overlay a blue-to-red heatmap of blur intensity on the image."""
-        h, w = blur_map.shape
-        heatmap = torch.zeros(h, w, 3, dtype=torch.float32, device=blur_map.device)
-
-        # Blue (sharp) -> Yellow (moderate) -> Red (blurry)
-        # Invert: high blur_map = sharp, so we invert for "blur intensity"
-        blur_intensity = 1.0 - blur_map
-
-        heatmap[:, :, 0] = torch.clamp(blur_intensity * 2.0, 0, 1)           # Red
-        heatmap[:, :, 1] = torch.clamp(2.0 - blur_intensity * 2.0, 0, 1)     # Green (yellow band)
-        heatmap[:, :, 2] = torch.clamp(1.0 - blur_intensity * 3.0, 0, 1)     # Blue
-
-        # Resize image if needed
+    def _create_face_visualization(image: torch.Tensor, blur_map: torch.Tensor,
+                                   bbox: dict, used_full: bool) -> torch.Tensor:
+        """Heatmap on face region, bbox outline on full image."""
         if image.dim() == 4:
             img = image[0]
         else:
             img = image
-        img = F.interpolate(
-            img.permute(2, 0, 1).unsqueeze(0),
-            size=(h, w), mode='bilinear', align_corners=False
-        ).squeeze(0).permute(1, 2, 0)
+        h_img, w_img, c = img.shape
 
-        overlay = img * (1 - alpha) + heatmap * alpha
-        overlay = torch.clamp(overlay, 0, 1)
-        return overlay.unsqueeze(0)
+        # Create heatmap for face region
+        fh, fw = blur_map.shape
+        heatmap = torch.zeros(fh, fw, 3, dtype=torch.float32, device=blur_map.device)
+        blur_inv = 1.0 - blur_map
+        heatmap[:, :, 0] = torch.clamp(blur_inv * 2.0, 0, 1)
+        heatmap[:, :, 1] = torch.clamp(2.0 - blur_inv * 2.0, 0, 1)
+        heatmap[:, :, 2] = torch.clamp(1.0 - blur_inv * 3.0, 0, 1)
 
-    # ------------------------------------------------------------------ #
-    #  Main entry point
-    # ------------------------------------------------------------------ #
+        # Build full-image visualization
+        pil_img = Image.fromarray((img.cpu().numpy() * 255).astype(np.uint8))
+        draw = ImageDraw.Draw(pil_img)
 
-    def detect_blur(self, image, method, block_size, blur_threshold, frequency_cutoff,
-                    depth_map=None, normal_map=None, specular_map=None,
-                    focus_distance=0.5, dof_falloff=2.0):
+        if not used_full:
+            # Draw face bbox
+            bx0 = int(bbox["x_min"] * w_img)
+            by0 = int(bbox["y_min"] * h_img)
+            bx1 = int(bbox["x_max"] * w_img)
+            by1 = int(bbox["y_max"] * h_img)
+            draw.rectangle([bx0, by0, bx1, by1], outline=(0, 255, 0), width=max(1, min(w_img, h_img) // 200))
 
-        # Convert to grayscale
-        if image.dim() == 4:
-            img = image[0]  # (H, W, C)
+            # Overlay heatmap on face region
+            face_heat_pil = Image.fromarray(
+                (heatmap.cpu().numpy() * 255).astype(np.uint8)
+            ).resize((bx1 - bx0, by1 - by0), Image.BILINEAR)
+
+            face_region = pil_img.crop((bx0, by0, bx1, by1))
+            blended = Image.blend(face_region, face_heat_pil, alpha=0.45)
+            pil_img.paste(blended, (bx0, by0))
+
+            # Draw eye region indicator
+            eye_y0 = by0 + int((by1 - by0) * 0.20)
+            eye_y1 = by0 + int((by1 - by0) * 0.45)
+            eye_x0 = bx0 + int((bx1 - bx0) * 0.10)
+            eye_x1 = bx0 + int((bx1 - bx0) * 0.90)
+            draw.rectangle([eye_x0, eye_y0, eye_x1, eye_y1],
+                           outline=(255, 255, 0), width=max(1, min(w_img, h_img) // 300))
         else:
-            img = image
+            # Full image heatmap blend
+            heat_pil = Image.fromarray(
+                (heatmap.cpu().numpy() * 255).astype(np.uint8)
+            ).resize((w_img, h_img), Image.BILINEAR)
+            pil_img = Image.blend(pil_img, heat_pil, alpha=0.45)
 
-        gray = img[:, :, 0] * 0.2989 + img[:, :, 1] * 0.5870 + img[:, :, 2] * 0.1140
-        h, w = gray.shape
-        debug_parts = []
+        result = torch.from_numpy(np.array(pil_img).astype(np.float32) / 255.0)
+        return result.unsqueeze(0)
 
-        # --- 1. Global Laplacian variance ---
-        lap = self._laplacian_variance(gray)
-        lap_var = lap.var().item()
-        debug_parts.append(f"Laplacian variance: {lap_var:.2f}")
+    # ------------------------------------------------------------------ #
+    #  Main entry
+    # ------------------------------------------------------------------ #
 
-        # --- 2. Frequency energy ---
-        gray_np = gray.cpu().numpy()
-        freq_ratio, _ = self._frequency_energy(gray_np, frequency_cutoff)
-        debug_parts.append(f"High-freq energy ratio: {freq_ratio:.4f}")
+    def detect_face_blur(self, image, blur_sensitivity, eye_weight, uniform_region_floor,
+                         face_bbox_json="", face_padding=0.15,
+                         depth_map=None, normal_map=None, specular_map=None,
+                         focus_distance=0.5, dof_falloff=2.0):
 
-        # --- 3. Gradient energy ---
-        grad = self._gradient_energy(gray)
-        grad_mean = grad.mean().item()
-        debug_parts.append(f"Gradient energy mean: {grad_mean:.4f}")
+        debug = []
 
-        # --- 4. Local blur map ---
-        blur_map = self._compute_local_blur_map(gray, block_size, method, frequency_cutoff)
+        # --- 1. Extract face crop ---
+        face_crop, bbox, used_full = self._extract_face_crop(image, face_bbox_json, face_padding)
+        fh, fw = face_crop.shape[0], face_crop.shape[1]
+        debug.append(f"Face crop: {fw}x{fh} ({'full image' if used_full else 'from bbox'})")
 
-        # --- 5. Depth-aware weighting (Blinn-Phong style) ---
-        depth_weight = None
-        if depth_map is not None:
-            depth_weight = self._depth_focus_weight(depth_map, focus_distance, dof_falloff)
-            depth_weight = F.interpolate(
-                depth_weight.unsqueeze(0).unsqueeze(0) if depth_weight.dim() == 2
-                else depth_weight.unsqueeze(0),
-                size=(h, w), mode='bilinear', align_corners=False
-            ).squeeze()
-            debug_parts.append(f"Depth-aware DoF applied (focus={focus_distance:.2f}, falloff={dof_falloff:.1f})")
+        # --- 2. Grayscale + contrast normalization ---
+        if face_crop.dim() == 2:
+            gray_raw = face_crop
+        elif face_crop.shape[-1] >= 3:
+            gray_raw = face_crop[:, :, 0] * 0.2989 + face_crop[:, :, 1] * 0.5870 + face_crop[:, :, 2] * 0.1140
+        else:
+            gray_raw = face_crop[:, :, 0]
 
-            # Weight the blur map: blur in out-of-focus regions is expected,
-            # blur in in-focus regions is problematic
-            # depth_weight high = in focus → blur there matters more
-            blur_map = blur_map * depth_weight + blur_map * 0.3 * (1 - depth_weight)
+        contrast_kernel = self._adaptive_kernel_size(min(fh, fw), fraction=0.08, min_k=3, max_k=63)
+        gray_norm = self._normalize_local_contrast(gray_raw, contrast_kernel)
+        debug.append(f"Contrast kernel: {contrast_kernel}")
 
-        # --- 6. Normal map detail weighting ---
-        if normal_map is not None:
-            normal_var = self._normal_variance_map(normal_map, block_size)
-            normal_var = F.interpolate(
-                normal_var.unsqueeze(0).unsqueeze(0),
-                size=(h, w), mode='bilinear', align_corners=False
-            ).squeeze()
-            # High normal variance + low sharpness = problematic blur
-            blur_map = blur_map * (0.7 + 0.3 * normal_var)
-            debug_parts.append("Normal-variance weighting applied")
+        # --- 3. Adaptive parameters ---
+        freq_cutoff = self._adaptive_freq_cutoff(fh, fw)
+        block_sizes, block_weights = self._adaptive_block_sizes(fh, fw)
+        debug.append(f"Freq cutoff: {freq_cutoff:.3f}")
+        debug.append(f"Block sizes: {block_sizes}")
 
-        # --- 7. Specular highlight sharpness ---
-        if specular_map is not None:
-            spec_sharp = self._specular_sharpness_indicator(specular_map)
-            spec_sharp = F.interpolate(
-                spec_sharp.unsqueeze(0).unsqueeze(0),
-                size=(h, w), mode='bilinear', align_corners=False
-            ).squeeze()
-            spec_score = spec_sharp.mean().item()
-            debug_parts.append(f"Specular sharpness indicator: {spec_score:.4f}")
-            # Blend specular info into blur map
-            blur_map = blur_map * (0.8 + 0.2 * spec_sharp)
+        # --- 4. Overall face blur map ---
+        blur_map = self._multiscale_face_blur_map(gray_norm, gray_raw, freq_cutoff, uniform_region_floor)
 
-        # Re-normalize blur_map
+        # --- 5. Eye region analysis (primary signal) ---
+        eye_metrics = self._analyze_face_region(gray_norm, gray_raw, self.EYE_REGION, freq_cutoff)
+        nose_metrics = self._analyze_face_region(gray_norm, gray_raw, self.NOSE_MOUTH_REGION, freq_cutoff)
+
+        if eye_metrics["valid"]:
+            debug.append(f"Eye: lap={eye_metrics['lap_var']:.3f} "
+                         f"grad={eye_metrics['grad_mean']:.4f} "
+                         f"freq={eye_metrics['freq_ratio']:.4f}")
+        if nose_metrics["valid"]:
+            debug.append(f"Nose/mouth: lap={nose_metrics['lap_var']:.3f} "
+                         f"grad={nose_metrics['grad_mean']:.4f}")
+
+        # --- 6. Map-based weighting (crop maps to face region) ---
+        if depth_map is not None and not used_full:
+            depth_face = self._crop_map_to_face(depth_map, bbox, fh, fw)
+            dw = self._depth_focus_weight(depth_face, focus_distance, dof_falloff)
+            if dw.dim() > 2:
+                dw = dw.squeeze()
+            dw = F.interpolate(dw.unsqueeze(0).unsqueeze(0),
+                               size=(fh, fw), mode='bilinear', align_corners=False).squeeze()
+            blur_map = blur_map * dw + blur_map * 0.3 * (1.0 - dw)
+            debug.append("Depth-aware weighting applied to face")
+
+        if specular_map is not None and not used_full:
+            spec_face = self._crop_map_to_face(specular_map, bbox, fh, fw)
+            pool_k = self._adaptive_kernel_size(min(fh, fw), fraction=0.06, min_k=3, max_k=31)
+            if pool_k % 2 == 0:
+                pool_k += 1
+            ss = self._specular_sharpness(spec_face, pool_k)
+            ss = F.interpolate(ss.unsqueeze(0).unsqueeze(0),
+                               size=(fh, fw), mode='bilinear', align_corners=False).squeeze()
+            blur_map = blur_map * (0.8 + 0.2 * ss)
+            debug.append(f"Specular sharpness applied (pool_k={pool_k})")
+
+        # Re-normalize
         bm_min, bm_max = blur_map.min(), blur_map.max()
         if bm_max - bm_min > 1e-6:
             blur_map = (blur_map - bm_min) / (bm_max - bm_min)
 
-        # --- Compute global scores ---
-        if method == "combined":
-            # Weighted combination of all signals
-            lap_score = min(lap_var / max(blur_threshold, 1e-6), 1.0)
-            freq_score = min(freq_ratio / 0.5, 1.0)
-            grad_score = min(grad_mean / 0.15, 1.0)
+        # --- 7. Composite score: eye region + overall face ---
+        overall_face_sharpness = blur_map.mean().item()
 
-            sharpness = 0.45 * lap_score + 0.30 * freq_score + 0.25 * grad_score
-        elif method == "laplacian":
-            sharpness = min(lap_var / max(blur_threshold, 1e-6), 1.0)
-        elif method == "frequency":
-            sharpness = min(freq_ratio / 0.5, 1.0)
-        elif method == "gradient_energy":
-            sharpness = min(grad_mean / 0.15, 1.0)
+        if eye_metrics["valid"]:
+            # Normalize eye metrics into a 0-1 sharpness score
+            # These denominators are empirical anchors
+            eye_lap_s = min(eye_metrics["lap_var"] / max(overall_face_sharpness * 200 + 1.0, 1.0), 1.0)
+            eye_grad_s = min(eye_metrics["grad_mean"] / 0.15, 1.0)
+            eye_freq_s = min(eye_metrics["freq_ratio"] / 0.5, 1.0)
+            eye_sharpness = 0.35 * eye_lap_s + 0.40 * eye_grad_s + 0.25 * eye_freq_s
         else:
-            sharpness = 0.0
+            eye_sharpness = overall_face_sharpness
 
+        if nose_metrics["valid"]:
+            nose_grad_s = min(nose_metrics["grad_mean"] / 0.12, 1.0)
+        else:
+            nose_grad_s = overall_face_sharpness
+
+        # Weighted blend: eyes dominate, nose/mouth secondary, rest of face tertiary
+        rest_weight = max(0.0, 1.0 - eye_weight - 0.15)
+        sharpness = (eye_weight * eye_sharpness +
+                     0.15 * nose_grad_s +
+                     rest_weight * overall_face_sharpness)
+
+        # Sensitivity curve
+        sensitivity_power = 2.0 - blur_sensitivity * 1.5  # [0.5 .. 2.0]
         sharpness = float(np.clip(sharpness, 0.0, 1.0))
-        blur_score = 1.0 - sharpness
+        blur_score = float(np.clip((1.0 - sharpness) ** sensitivity_power, 0.0, 1.0))
+        sharpness_final = 1.0 - blur_score
 
-        debug_parts.append(f"Global blur score: {blur_score:.4f}")
-        debug_parts.append(f"Global sharpness:  {sharpness:.4f}")
-        debug_parts.append(f"Method: {method}")
+        debug.append(f"Eye sharpness: {eye_sharpness:.4f} (weight={eye_weight})")
+        debug.append(f"Overall face sharpness: {overall_face_sharpness:.4f}")
+        debug.append(f"Blur score: {blur_score:.4f} | Sharpness: {sharpness_final:.4f}")
 
-        # --- Visualization ---
-        viz = self._create_heatmap_overlay(image, blur_map, alpha=0.45)
+        # --- 8. Output mask (full image size, face region marked) ---
+        if image.dim() == 4:
+            full_h, full_w = image.shape[1], image.shape[2]
+        else:
+            full_h, full_w = image.shape[0], image.shape[1]
 
-        # blur_map as MASK (inverted: 1 = blurry)
-        mask_out = (1.0 - blur_map).unsqueeze(0)
+        full_mask = torch.zeros(full_h, full_w, dtype=torch.float32, device=image.device)
 
-        debug_info = " | ".join(debug_parts)
+        if not used_full:
+            # Place face blur map into full-image mask
+            px_y0 = int(bbox["y_min"] * full_h)
+            px_y1 = int(bbox["y_max"] * full_h)
+            px_x0 = int(bbox["x_min"] * full_w)
+            px_x1 = int(bbox["x_max"] * full_w)
 
-        return (blur_score, sharpness, mask_out, viz, debug_info)
+            face_blur_resized = F.interpolate(
+                (1.0 - blur_map).unsqueeze(0).unsqueeze(0),
+                size=(px_y1 - px_y0, px_x1 - px_x0),
+                mode='bilinear', align_corners=False
+            ).squeeze()
+
+            full_mask[px_y0:px_y1, px_x0:px_x1] = face_blur_resized
+        else:
+            full_mask = F.interpolate(
+                (1.0 - blur_map).unsqueeze(0).unsqueeze(0),
+                size=(full_h, full_w),
+                mode='bilinear', align_corners=False
+            ).squeeze()
+
+        # --- 9. Visualization ---
+        viz = self._create_face_visualization(image, blur_map, bbox, used_full)
+
+        debug_info = " | ".join(debug)
+        return (blur_score, sharpness_final, full_mask.unsqueeze(0), viz, debug_info)
 
 
 # ------------------------------------------------------------------ #
@@ -454,9 +681,9 @@ class BlurDetectionNode:
 # ------------------------------------------------------------------ #
 
 NODE_CLASS_MAPPINGS = {
-    "BlurDetectionNode": BlurDetectionNode,
+    "FaceBlurDetectionNode": FaceBlurDetectionNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "BlurDetectionNode": "Blur Detection (Blinn-Phong + Crompton)",
+    "FaceBlurDetectionNode": "Face Blur Detection (Adaptive Resolution)",
 }
